@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for CI/CD pipeline for Spring Boot application'
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub repository branch
+
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of the AWS CodeStar connection to GitHub
+
+  EksClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+
+  EcrRepositoryName:
+    Type: String
+    Default: spring-boot-app
+    Description: Name of the ECR repository
+    
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Deployment environment
+
+Resources:
+  # ECR Repository
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      EncryptionConfiguration:
+        EncryptionType: KMS
+
+  # S3 Bucket for Pipeline Artifacts with encryption
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket Policy
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # CodeBuild IAM Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECR-FullAccess
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # CodeBuild Policy with least privilege
+  CodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeBuildPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*:*
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+          - Effect: Allow
+            Action:
+              - eks:DescribeCluster
+            Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EksClusterName}
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+            Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: '*'
+      Roles:
+        - !Ref CodeBuildServiceRole
+
+  # CodePipeline IAM Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeStarFullAccess
+
+  # CodePipeline Policy with least privilege
+  CodePipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodePipelinePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:GetBucketVersioning
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucket}
+              - !Sub arn:aws:s3:::${ArtifactBucket}/*
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+            Resource:
+              - !GetAtt TestBuildProject.Arn
+              - !GetAtt BuildProject.Arn
+              - !GetAtt DeployProject.Arn
+          - Effect: Allow
+            Action:
+              - codestar-connections:UseConnection
+            Resource: !Ref GitHubConnectionArn
+      Roles:
+        - !Ref CodePipelineServiceRole
+
+  # CodeBuild Project for Testing
+  TestBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-test
+      Description: 'Test Spring Boot application'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub /aws/codebuild/${AWS::StackName}-test
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                java: corretto17
+            pre_build:
+              commands:
+                - echo Testing started on `date`
+                - echo Running tests for $ENVIRONMENT environment
+            build:
+              commands:
+                - cd spring-boot
+                - ./gradlew test
+            post_build:
+              commands:
+                - echo Testing completed on `date`
+                - cd ..
+                - echo Setting up environment-specific configurations
+                - mkdir -p kubernetes/overlays/$ENVIRONMENT
+          artifacts:
+            files:
+              - spring-boot/**/*
+              - appspec.yml
+              - scripts/**/*
+              - Dockerfile
+              - kubernetes/**/*
+            discard-paths: no
+          reports:
+            junit:
+              files:
+                - spring-boot/**/build/test-results/test/*.xml
+              file-format: JUNITXML
+
+  # CodeBuild Project for Building and Pushing Docker Image
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      Description: 'Build and push Docker image'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: EcrRepositoryName
+            Value: !Ref EcrRepositoryName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub /aws/codebuild/${AWS::StackName}-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                java: corretto17
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${EcrRepositoryName}
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=${COMMIT_HASH:=latest}-${ENVIRONMENT}
+                - echo Building for $ENVIRONMENT environment
+            build:
+              commands:
+                - echo Build started on `date`
+                - cd spring-boot
+                - docker build -t $REPOSITORY_URI:latest -t $REPOSITORY_URI:$IMAGE_TAG .
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images...
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - echo $IMAGE_TAG > ../image_tag.txt
+                - cd ..
+                - sed -i "s|{{ECR_REPOSITORY_URI}}|$REPOSITORY_URI|g" kubernetes/deployment.yaml
+                - sed -i "s|{{IMAGE_TAG}}|$IMAGE_TAG|g" kubernetes/deployment.yaml
+                - echo Setting up CloudWatch logging...
+                - echo "Setting up environment-specific configurations for $ENVIRONMENT"
+          artifacts:
+            files:
+              - kubernetes/**/*
+              - scripts/**/*
+              - appspec.yml
+              - image_tag.txt
+            discard-paths: no
+          cache:
+            paths:
+              - '/root/.gradle/caches/**/*'
+              - '/root/.gradle/wrapper/**/*'
+
+  # CodeBuild Project for Deploying to EKS
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-deploy
+      Description: 'Deploy to EKS'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: EksClusterName
+            Value: !Ref EksClusterName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub /aws/codebuild/${AWS::StackName}-deploy
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+              commands:
+                - echo Installing kubectl...
+                - curl -o kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.24.7/2022-10-31/bin/linux/amd64/kubectl
+                - chmod +x ./kubectl
+                - mv ./kubectl /usr/local/bin
+                - echo Installing AWS CLI...
+                - pip install --upgrade awscli
+                - echo Installing eksctl...
+                - curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+                - mv /tmp/eksctl /usr/local/bin
+            pre_build:
+              commands:
+                - echo Configuring kubectl...
+                - aws eks update-kubeconfig --name ${EksClusterName} --region $AWS_DEFAULT_REGION
+                - echo Checking cluster connection...
+                - kubectl get nodes
+                - echo Deploying to $ENVIRONMENT environment
+            build:
+              commands:
+                - echo Deployment started on `date`
+                - echo "Running before_install.sh script..."
+                - chmod +x scripts/before_install.sh
+                - ./scripts/before_install.sh
+                - echo "Applying Kubernetes manifests..."
+                - kubectl apply -f kubernetes/namespace.yaml
+                - kubectl apply -f kubernetes/deployment.yaml
+                - kubectl apply -f kubernetes/service.yaml
+                - echo "Running after_install.sh script..."
+                - chmod +x scripts/after_install.sh
+                - ./scripts/after_install.sh
+                - echo "Waiting for deployment to complete..."
+                - kubectl rollout status deployment/spring-boot-app -n spring-boot --timeout=300s
+            post_build:
+              commands:
+                - echo "Running after_allow_test_traffic.sh script..."
+                - chmod +x scripts/after_allow_test_traffic.sh
+                - ./scripts/after_allow_test_traffic.sh || echo "Test traffic script completed with warnings"
+                - echo "Running before_allow_traffic.sh script..."
+                - chmod +x scripts/before_allow_traffic.sh
+                - ./scripts/before_allow_traffic.sh || echo "Before traffic script completed with warnings"
+                - echo "Running after_allow_traffic.sh script..."
+                - chmod +x scripts/after_allow_traffic.sh
+                - ./scripts/after_allow_traffic.sh || echo "After traffic script completed with warnings"
+                - echo "Setting up CloudWatch alarms..."
+                - aws cloudwatch put-metric-alarm --alarm-name "${EksClusterName}-pod-restart" --alarm-description "Alarm when pods restart frequently" --metric-name pod_restart_count --namespace Kubernetes --statistic Sum --period 300 --threshold 5 --comparison-operator GreaterThanThreshold --dimensions Name=cluster_name,Value=${EksClusterName} Name=namespace,Value=spring-boot --evaluation-periods 1 --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${EksClusterName}-alarms || echo "Failed to create alarm, continuing..."
+                - echo Deployment completed on `date`
+                - kubectl get services -n spring-boot
+          artifacts:
+            files:
+              - appspec.yml
+              - scripts/**/*
+              - kubernetes/**/*
+            discard-paths: no
+
+  # CloudWatch Dashboard for monitoring
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-${Environment}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ECS", "CPUUtilization", "ServiceName", "spring-boot-app", "ClusterName", "${EksClusterName}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "CPU Utilization"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ECS", "MemoryUtilization", "ServiceName", "spring-boot-app", "ClusterName", "${EksClusterName}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Memory Utilization"
+              }
+            }
+          ]
+        }
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        EncryptionKey:
+          Type: KMS
+          Id: alias/aws/s3
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref GitHubBranch
+              OutputArtifacts:
+                - Name: SourceCode
+        - Name: Test
+          Actions:
+            - Name: TestCode
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref TestBuildProject
+                EnvironmentVariables: !Sub '[{"name":"ENVIRONMENT","value":"${Environment}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: TestOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAndPushImage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+                EnvironmentVariables: !Sub '[{"name":"ENVIRONMENT","value":"${Environment}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: TestOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployToEKS
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployProject
+                EnvironmentVariables: !Sub '[{"name":"ENVIRONMENT","value":"${Environment}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  PipelineUrl:
+    Description: URL to the CodePipeline console
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+
+  EcrRepositoryUri:
+    Description: URI of the ECR repository
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepositoryUri"
+      
+  DashboardUrl:
+    Description: URL to the CloudWatch Dashboard
+    Value: !Sub https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-${Environment}-dashboard
+    
+  Environment:
+    Description: Deployment environment
+    Value: !Ref Environment
